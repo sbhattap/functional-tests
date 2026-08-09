@@ -1,10 +1,11 @@
-"""Tests for $lastN accumulator: n-vs-size behavior, sort order, null/missing,
-mixed types, and empty-group handling.
+"""Tests for $lastN accumulator: n-vs-size behavior, per-group accumulation, sort
+order, null/missing, mixed types, and empty-group handling.
 
-$lastN returns the last ``n`` elements of a group as an array, in the order
-determined by the preceding $sort stage. Like $last (and unlike numeric
-accumulators), $lastN does NOT skip null or missing values -- they are included
-in the returned array as null."""
+$lastN returns the last ``n`` elements of a group as an array, ordered by the
+preceding $sort stage.
+
+Not covered by design: pipelines with no $sort, and tied sort keys -- which
+documents land in the last n is unspecified, so any assertion would be flaky."""
 
 from __future__ import annotations
 
@@ -22,9 +23,8 @@ from documentdb_tests.framework.test_constants import (
     FLOAT_NAN,
 )
 
-# Property [n vs Group Size]: $lastN returns min(n, group size) elements. When n
-# exceeds the number of documents, all available values are returned; n == 1
-# returns a single-element list (not a scalar).
+# Property [n vs Group Size]: $lastN returns min(n, group size) elements, and
+# n == 1 returns a single-element list rather than a scalar.
 LASTN_N_VALUE_TESTS: list[AccumulatorTestCase] = [
     AccumulatorTestCase(
         "n_greater_than_size",
@@ -88,6 +88,29 @@ LASTN_N_VALUE_TESTS: list[AccumulatorTestCase] = [
     ),
 ]
 
+# Property [Per-Group Accumulation]: each group accumulates independently and n
+# applies per group, so a group with fewer than n documents yields only what it has.
+LASTN_MULTIPLE_GROUP_TESTS: list[AccumulatorTestCase] = [
+    AccumulatorTestCase(
+        "groups_two_independent",
+        docs=[
+            {"_id": 0, "cat": "A", "v": 10},
+            {"_id": 1, "cat": "A", "v": 20},
+            {"_id": 2, "cat": "A", "v": 30},
+            {"_id": 3, "cat": "B", "v": 40},
+        ],
+        # No $project: _id carries the group identity under test. The trailing
+        # $sort makes document order deterministic.
+        pipeline=[
+            {"$sort": {"_id": 1}},
+            {"$group": {"_id": "$cat", "result": {"$lastN": {"n": 2, "input": "$v"}}}},
+            {"$sort": {"_id": 1}},
+        ],
+        expected=[{"_id": "A", "result": [20, 30]}, {"_id": "B", "result": [40]}],
+        msg="$lastN should accumulate independently per group",
+    ),
+]
+
 # Property [Sort Order Dependency]: $lastN returns the last n values as ordered
 # by the preceding $sort stage, preserving that order in the output array.
 LASTN_SORT_ORDER_TESTS: list[AccumulatorTestCase] = [
@@ -146,7 +169,7 @@ LASTN_SORT_ORDER_TESTS: list[AccumulatorTestCase] = [
 ]
 
 # Property [Null and Missing Handling]: $lastN includes null and missing values
-# in the returned array (missing fields become null). It does NOT skip them.
+# (missing becomes null) rather than skipping them, unlike numeric accumulators.
 LASTN_NULL_MISSING_TESTS: list[AccumulatorTestCase] = [
     AccumulatorTestCase(
         "null_in_last_n",
@@ -243,8 +266,8 @@ LASTN_MIXED_TYPE_TESTS: list[AccumulatorTestCase] = [
     ),
 ]
 
-# Property [Empty-Group Behavior]: $lastN on an empty collection produces no
-# groups (an empty result set), matching $last.
+# Property [Empty-Group Behavior]: $lastN produces no groups when no documents
+# reach $group, whether the collection is empty or $match excluded them all.
 LASTN_EMPTY_GROUP_TESTS: list[AccumulatorTestCase] = [
     AccumulatorTestCase(
         "empty_collection",
@@ -256,10 +279,22 @@ LASTN_EMPTY_GROUP_TESTS: list[AccumulatorTestCase] = [
         expected=[],
         msg="$lastN on an empty collection should produce no groups",
     ),
+    AccumulatorTestCase(
+        "all_documents_filtered_out",
+        docs=[{"_id": 0, "cat": "A", "v": 10}, {"_id": 1, "cat": "B", "v": 20}],
+        pipeline=[
+            {"$match": {"cat": "Z"}},
+            {"$group": {"_id": None, "result": {"$lastN": {"n": 2, "input": "$v"}}}},
+            {"$project": {"_id": 0, "result": 1}},
+        ],
+        expected=[],
+        msg="$lastN should produce no groups when every document is filtered out",
+    ),
 ]
 
 LASTN_SUCCESS_TESTS = (
     LASTN_N_VALUE_TESTS
+    + LASTN_MULTIPLE_GROUP_TESTS
     + LASTN_SORT_ORDER_TESTS
     + LASTN_NULL_MISSING_TESTS
     + LASTN_MIXED_TYPE_TESTS
@@ -267,6 +302,7 @@ LASTN_SUCCESS_TESTS = (
 )
 
 
+@pytest.mark.aggregate
 @pytest.mark.parametrize("test_case", pytest_params(LASTN_SUCCESS_TESTS))
 def test_accumulator_lastN(collection, test_case: AccumulatorTestCase):
     """Test $lastN accumulator success cases."""
